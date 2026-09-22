@@ -11,9 +11,18 @@ path = "src/main.rs"
 name = "wire-httpget"
 path = "src/bin/httpget.rs"
 
+[[bin]]
+name = "wire-perf"
+path = "src/bin/perf.rs"
+
+[[bin]]
+name = "wire-curl"
+path = "src/bin/curl.rs"
+
 [dependencies]
 wire-core = { path = "../wire-core" }
 wire-tap = { path = "../wire-tap" }
+wire-sim = { path = "../wire-sim" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

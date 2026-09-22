@@ -17,17 +17,24 @@ fn main() -> anyhow::Result<()> {
             stack.on_tick(now);
             last_tick = now;
         }
-        let n = tap.read(&mut buf)?;
-        stack.on_packet(&buf[..n], now);
+
+        let mut read_any = false;
+        while let Some(n) = tap.poll_read(&mut buf)? {
+            stack.on_packet(&buf[..n], now);
+            read_any = true;
+        }
+
         for tuple in stack.active_connections() {
             let data = stack.tcp_recv(tuple);
             if !data.is_empty() {
                 stack.tcp_send(tuple, &data);
+                stack.flush(now);
             }
             if let Some(wire_core::TcpState::CloseWait) = stack.connection_state(tuple) {
                 stack.tcp_close(tuple, now);
             }
         }
+
         while let Some(mut tx_packet) = stack.tx_queue.pop_front() {
             if tx_packet.len() >= 34 {
                 let dst_ip = Ipv4Address(tx_packet[30..34].try_into().unwrap());
@@ -35,7 +42,17 @@ fn main() -> anyhow::Result<()> {
                     tx_packet[0..6].copy_from_slice(&mac.0);
                 }
             }
-            tap.write(&tx_packet)?;
+            match tap.write_async(&tx_packet)? {
+                Some(_) => {}
+                None => {
+                    stack.tx_queue.push_front(tx_packet);
+                    break;
+                }
+            }
+        }
+
+        if !read_any {
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
     }
 }

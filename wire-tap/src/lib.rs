@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
-use std::io::{Read, Write, Result};
 use std::os::unix::io::AsRawFd;
+use std::io::Result;
 
 #[repr(C)]
 struct IfReq {
@@ -39,14 +39,53 @@ impl TapDevice {
             return Err(std::io::Error::last_os_error());
         }
 
+        unsafe {
+            let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
         Ok(Self { file })
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.file.read(buf)
+    pub fn poll_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        let n = unsafe {
+            libc::read(
+                self.file.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n > 0 {
+            Ok(Some(n as usize))
+        } else if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.file.write(buf)
+    pub fn write_async(&mut self, buf: &[u8]) -> Result<Option<usize>> {
+        let n = unsafe {
+            libc::write(
+                self.file.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+            )
+        };
+        if n >= 0 {
+            Ok(Some(n as usize))
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
     }
 }

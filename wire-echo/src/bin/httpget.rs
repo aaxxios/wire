@@ -29,8 +29,9 @@ fn main() -> anyhow::Result<()> {
             last_tick = now;
         }
 
-        let n = tap.read(&mut buf)?;
-        stack.on_packet(&buf[..n], now);
+        if let Some(n) = tap.poll_read(&mut buf)? {
+            stack.on_packet(&buf[..n], now);
+        }
 
         if let Some(state) = stack.connection_state(tuple) {
             if state == TcpState::Established && !request_sent {
@@ -58,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
         while let Some(mut tx_packet) = stack.tx_queue.pop_front() {
             stack.resolve_and_populate_dst_mac(&mut tx_packet);
-            tap.write(&tx_packet)?;
+            tap.write_async(&tx_packet)?;
         }
     }
 
