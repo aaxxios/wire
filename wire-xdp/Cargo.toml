@@ -1,0 +1,9 @@
+[package]
+name = "wire-xdp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wire-core = { path = "../wire-core" }
+libc.workspace = true
+anyhow.workspace = true

@@ -70,22 +70,22 @@ impl TapDevice {
     }
 
     pub fn write_async(&mut self, buf: &[u8]) -> Result<Option<usize>> {
-        let n = unsafe {
-            libc::write(
-                self.file.as_raw_fd(),
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-            )
-        };
-        if n >= 0 {
-            Ok(Some(n as usize))
+    let n = unsafe {
+        libc::write(
+            self.file.as_raw_fd(),
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+        )
+    };
+    if n >= 0 {
+        Ok(Some(n as usize))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+            Ok(None)
         } else {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
-                Ok(None)
-            } else {
-                Err(err)
-            }
+            Err(err)
         }
     }
+}
 }

@@ -65,8 +65,8 @@ pub fn run_simulation(seed: u64, config: &SimConfig) -> SimResult {
     let ip_a = Ipv4Address([10, 0, 0, 1]);
     let ip_b = Ipv4Address([10, 0, 0, 2]);
 
-    let mut stack_a = Stack::new(mac_a, ip_a);
-    let mut stack_b = Stack::new(mac_b, ip_b);
+    let mut stack_a = Stack::new(mac_a, ip_a, ip_b);
+    let mut stack_b = Stack::new(mac_b, ip_b, ip_a);
 
     stack_a.arp_cache.insert(ip_b, mac_b);
     stack_b.arp_cache.insert(ip_a, mac_a);

@@ -6,11 +6,12 @@ fn main() -> anyhow::Result<()> {
     let mut tap = TapDevice::new("tap0")?;
     let local_mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let local_ip = Ipv4Address([192, 168, 99, 2]);
+    let gateway_ip = Ipv4Address([192, 168, 99, 1]);
     let remote_ip = Ipv4Address([192, 168, 99, 1]);
     let remote_port = 8000;
     let local_port = 49152;
 
-    let mut stack = Stack::new(local_mac, local_ip);
+    let mut stack = Stack::new(local_mac, local_ip, gateway_ip);
     let mut buf = [0u8; 2048];
     let mut last_tick = Instant::now();
 
@@ -29,8 +30,10 @@ fn main() -> anyhow::Result<()> {
             last_tick = now;
         }
 
-        if let Some(n) = tap.poll_read(&mut buf)? {
+        let mut read_any = false;
+        while let Some(n) = tap.poll_read(&mut buf)? {
             stack.on_packet(&buf[..n], now);
+            read_any = true;
         }
 
         if let Some(state) = stack.connection_state(tuple) {
@@ -38,6 +41,7 @@ fn main() -> anyhow::Result<()> {
                 println!("✅ Connection established! Sending HTTP GET...");
                 let http_req = b"GET /index.html HTTP/1.1\r\nHost: 192.168.99.1\r\nConnection: close\r\n\r\n";
                 stack.tcp_send(tuple, http_req);
+                stack.flush(now);
                 request_sent = true;
             }
 
@@ -50,16 +54,24 @@ fn main() -> anyhow::Result<()> {
                 println!("📥 Server closed connection (FIN received). Closing our side.");
                 stack.tcp_close(tuple, now);
             }
-        } else {
-            if request_sent {
-                println!("🛑 Connection closed cleanly by stack.");
-                break;
-            }
+        } else if request_sent {
+            println!("🛑 Connection closed cleanly by stack.");
+            break;
         }
 
         while let Some(mut tx_packet) = stack.tx_queue.pop_front() {
             stack.resolve_and_populate_dst_mac(&mut tx_packet);
-            tap.write_async(&tx_packet)?;
+            match tap.write_async(&tx_packet)? {
+                Some(_) => {}
+                None => {
+                    stack.tx_queue.push_front(tx_packet);
+                    break;
+                }
+            }
+        }
+
+        if !read_any {
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 

@@ -4,12 +4,14 @@ use wire_sim::{SimConfig, run_simulation};
 
 fn main() {
     println!("\x1b[1;36m================================================================================\x1b[0m");
-    println!("\x1b[1;37m                       WIRE TCP/IP STACK BENCHMARK SUITE                        \x1b[0m");
+    println!("\x1b[1;37m                       WIRE V3 TCP/IP STACK BENCHMARK SUITE                     \x1b[0m");
     println!("\x1b[1;36m================================================================================\x1b[0m\n");
 
     bench_checksum();
     println!();
     bench_fsm_throughput();
+    println!();
+    bench_bbr_pacing_evaluation();
     println!();
     bench_simulation_chaos();
     println!();
@@ -20,7 +22,7 @@ fn main() {
 }
 
 fn bench_checksum() {
-    println!("\x1b[1;33m[1/3] Internet Checksum (RFC 1071) Computation Performance\x1b[0m");
+    println!("\x1b[1;33m[1/4] Internet Checksum (RFC 1071) Computation Performance\x1b[0m");
     println!("--------------------------------------------------------------------------------");
     
     let chunk_size = 1460;
@@ -49,12 +51,13 @@ fn bench_checksum() {
 }
 
 fn bench_fsm_throughput() {
-    println!("\x1b[1;33m[2/3] Pure Core State-Machine Ingress Packet Throughput\x1b[0m");
+    println!("\x1b[1;33m[2/4] Pure Core State-Machine Ingress Packet Throughput\x1b[0m");
     println!("--------------------------------------------------------------------------------");
 
     let mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let ip = Ipv4Address([192, 168, 99, 2]);
-    let mut stack = Stack::new(mac, ip);
+    let gw = Ipv4Address([192, 168, 99, 1]);
+    let mut stack = Stack::new(mac, ip, gw);
     stack.listen(8080);
 
     let client_mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
@@ -167,8 +170,34 @@ fn bench_fsm_throughput() {
     println!("  Processing Rate:       \x1b[1;32m{:.2} MB/s\x1b[0m", mb_rate);
 }
 
+fn bench_bbr_pacing_evaluation() {
+    println!("\x1b[1;33m[3/4] Google BBR Pacing Engine Calculation Latency\x1b[0m");
+    println!("--------------------------------------------------------------------------------");
+
+    let mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let ip = Ipv4Address([192, 168, 99, 2]);
+    let gw = Ipv4Address([192, 168, 99, 1]);
+    let mut stack = Stack::new(mac, ip, gw);
+
+    let tuple = stack.tcp_connect(gw, 8080, 51000, Instant::now());
+    let conn = stack.connections.get_mut(&tuple).unwrap();
+    conn.bbr_max_bw = 1.25;
+
+    let start = Instant::now();
+    let iterations = 100_000;
+    for _ in 0..iterations {
+        conn.flush_send_buffer(&mut stack.tx_queue, Instant::now());
+    }
+    let elapsed = start.elapsed();
+    let ns_per_op = elapsed.as_nanos() as f64 / iterations as f64;
+
+    println!("  Pacing Target Rate:    10 Gbps (Saturated)");
+    println!("  Iterations:            {}", iterations);
+    println!("  FSM Pacing Latency:    \x1b[1;32m{:.2} ns/eval\x1b[0m", ns_per_op);
+}
+
 fn bench_simulation_chaos() {
-    println!("\x1b[1;33m[3/3] Deterministic Chaos Simulation Transfer Engine\x1b[0m");
+    println!("\x1b[1;33m[4/4] BBR + SACK Scoreboard Deterministic Chaos Simulation\x1b[0m");
     println!("--------------------------------------------------------------------------------");
     println!("  {:<18} | {:<10} | {:<12} | {:<14} | {:<10}", "Scenario", "Loss/Dup", "Payload", "Duration", "Sim Pkts/sec");
     println!("--------------------------------------------------------------------------------");

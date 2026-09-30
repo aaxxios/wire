@@ -19,10 +19,17 @@ path = "src/bin/perf.rs"
 name = "wire-curl"
 path = "src/bin/curl.rs"
 
+[[bin]]
+name = "wire-xdp-echo"
+path = "src/bin/xdp_echo.rs"
+
 [dependencies]
 wire-core = { path = "../wire-core" }
 wire-tap = { path = "../wire-tap" }
+wire-xdp = { path = "../wire-xdp" }
 wire-sim = { path = "../wire-sim" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+libc.workspace = true
+rustls.workspace = true

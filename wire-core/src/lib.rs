@@ -358,6 +358,17 @@ pub struct SentSegment {
     pub data: Vec<u8>,
     pub sent_at: Instant,
     pub retransmit_count: u32,
+    pub sacked: bool,
+    pub lost: bool,
+    pub delivered_at_send: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BbrState {
+    Startup,
+    Drain,
+    ProbeBw,
+    ProbeRtt,
 }
 
 pub struct TcpConnection {
@@ -375,6 +386,7 @@ pub struct TcpConnection {
     pub out_of_order: BTreeMap<u32, Vec<u8>>,
     pub send_buffer: VecDeque<u8>,
     pub receive_buffer: VecDeque<u8>,
+    
     pub cwnd: u32,
     pub ssthresh: u32,
     pub dup_ack_count: u8,
@@ -391,11 +403,33 @@ pub struct TcpConnection {
     pub last_peer_tsval: u32,
     pub base_time: Instant,
     pub fin_requested: bool,
+    pub sack_scoreboard: Vec<(Seq, Seq)>,
+
+    pub in_recovery_episode: bool,
+    pub recovery_point: Seq,
+    pub high_ack: Seq,
+    pub pipe: u32,
+    pub rescue_rx: Option<Seq>,
+
+    pub bbr_state: BbrState,
+    pub bbr_pacing_gain: f64,
+    pub bbr_cwnd_gain: f64,
+    pub bbr_max_bw: f64,
+    pub bbr_min_rtt: Duration,
+    pub bbr_min_rtt_stamp: Instant,
+    pub bbr_cycle_idx: usize,
+    pub bbr_cycle_stamp: Instant,
+    pub bbr_delivered: u64,
+    pub bbr_delivered_stamp: Instant,
+    pub bbr_full_bw: f64,
+    pub bbr_full_bw_count: usize,
+    pub bbr_next_pacing_time: Instant,
 }
 
 pub struct Stack {
     pub mac: MacAddress,
     pub ip: Ipv4Address,
+    pub gateway_ip: Ipv4Address,
     pub arp_cache: HashMap<Ipv4Address, MacAddress>,
     pub connections: HashMap<SocketTuple, TcpConnection>,
     pub listening_ports: HashMap<u16, TcpState>,
@@ -405,9 +439,9 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(mac: MacAddress, ip: Ipv4Address) -> Self {
+    pub fn new(mac: MacAddress, ip: Ipv4Address, gateway_ip: Ipv4Address) -> Self {
         Self {
-            mac, ip,
+            mac, ip, gateway_ip,
             arp_cache: HashMap::new(),
             connections: HashMap::new(),
             listening_ports: HashMap::new(),
@@ -485,7 +519,7 @@ impl Stack {
         let frame = self.encapsulate_ipv4_tcp(self.ip, remote_ip, seg.clone());
         self.tx_queue.push_back(frame);
         conn.retransmit_queue.push_back(SentSegment {
-            seq: iss, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0,
+            seq: iss, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0, sacked: false, lost: false, delivered_at_send: 0,
         });
         self.connections.insert(tuple, conn);
         tuple
@@ -667,15 +701,27 @@ impl Stack {
         self.tx_queue.push_back(req);
     }
 
+    pub fn is_same_subnet(&self, other_ip: Ipv4Address) -> bool {
+        self.ip.0[0] == other_ip.0[0]
+            && self.ip.0[1] == other_ip.0[1]
+            && self.ip.0[2] == other_ip.0[2]
+    }
+
     pub fn resolve_and_populate_dst_mac(&mut self, packet: &mut [u8]) {
         if packet.len() >= 34 {
             let ethertype = u16::from_be_bytes([packet[12], packet[13]]);
             if ethertype == 0x0800 {
                 let dst_ip = Ipv4Address(packet[30..34].try_into().unwrap());
-                if let Some(mac) = self.arp_cache.get(&dst_ip) {
+                let next_hop_ip = if self.is_same_subnet(dst_ip) {
+                    dst_ip
+                } else {
+                    self.gateway_ip
+                };
+
+                if let Some(mac) = self.arp_cache.get(&next_hop_ip) {
                     packet[0..6].copy_from_slice(&mac.0);
                 } else {
-                    self.send_arp_request(dst_ip);
+                    self.send_arp_request(next_hop_ip);
                 }
             }
         }
@@ -758,7 +804,7 @@ impl TcpConnection {
             out_of_order: BTreeMap::new(),
             send_buffer: VecDeque::new(),
             receive_buffer: VecDeque::new(),
-            cwnd: 1460, ssthresh: 65535, dup_ack_count: 0,
+            cwnd: 5840, ssthresh: 65535, dup_ack_count: 0,
             srtt: None, rttvar: Duration::from_millis(100),
             rto: Duration::from_millis(200),
             time_wait_expiry: None,
@@ -771,11 +817,68 @@ impl TcpConnection {
             last_peer_tsval: 0,
             base_time: now,
             fin_requested: false,
+            sack_scoreboard: Vec::new(),
+            
+            in_recovery_episode: false,
+            recovery_point: iss,
+            high_ack: iss,
+            pipe: 0,
+            rescue_rx: None,
+
+            bbr_state: BbrState::Startup,
+            bbr_pacing_gain: 2.89,
+            bbr_cwnd_gain: 2.89,
+            bbr_max_bw: 0.1,
+            bbr_min_rtt: Duration::from_millis(200),
+            bbr_min_rtt_stamp: now,
+            bbr_cycle_idx: 0,
+            bbr_cycle_stamp: now,
+            bbr_delivered: 0,
+            bbr_delivered_stamp: now,
+            bbr_full_bw: 0.0,
+            bbr_full_bw_count: 0,
+            bbr_next_pacing_time: now,
         }
     }
 
     pub fn current_ts(&self, now: Instant) -> u32 {
         (now.duration_since(self.base_time).as_millis() as u32).wrapping_add(1000)
+    }
+
+    pub fn generate_sack_blocks(&self) -> Vec<(Seq, Seq)> {
+        let mut blocks = Vec::new();
+        if self.out_of_order.is_empty() { return blocks; }
+
+        let mut start = None;
+        let mut end = None;
+
+        for (&seq, payload) in &self.out_of_order {
+            let block_start = Seq(seq);
+            let block_end = block_start.wrapping_add(payload.len() as u32);
+
+            match (start, end) {
+                (None, None) => {
+                    start = Some(block_start);
+                    end = Some(block_end);
+                }
+                (Some(_s), Some(e)) if e == block_start => {
+                    end = Some(block_end);
+                }
+                (Some(s), Some(e)) => {
+                    blocks.push((s, e));
+                    start = Some(block_start);
+                    end = Some(block_end);
+                    if blocks.len() == 3 { break; }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(s), Some(e)) = (start, end) {
+            if blocks.len() < 3 {
+                blocks.push((s, e));
+            }
+        }
+        blocks
     }
 
     pub fn negotiate_options(&mut self, hdr: &TcpHeader) {
@@ -824,7 +927,7 @@ impl TcpConnection {
         seg[16..18].copy_from_slice(&csum.to_be_bytes());
         tx_queue.push_back(self.encapsulate_ipv4_tcp(seg.clone()));
         self.retransmit_queue.push_back(SentSegment {
-            seq: self.iss, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0,
+            seq: self.iss, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0, sacked: false, lost: false, delivered_at_send: self.bbr_delivered,
         });
     }
 
@@ -846,7 +949,7 @@ impl TcpConnection {
         seg[16..18].copy_from_slice(&csum.to_be_bytes());
         tx_queue.push_back(self.encapsulate_ipv4_tcp(seg.clone()));
         self.retransmit_queue.push_back(SentSegment {
-            seq: self.snd_nxt, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0,
+            seq: self.snd_nxt, seq_len: 1, data: seg, sent_at: now, retransmit_count: 0, sacked: false, lost: false, delivered_at_send: self.bbr_delivered,
         });
         self.snd_nxt = self.snd_nxt.wrapping_add(1);
     }
@@ -856,6 +959,13 @@ impl TcpConnection {
         if self.ts_enabled {
             let tsval = self.current_ts(now);
             options.push(TcpOption::Timestamp { tsval, tsecr: self.last_peer_tsval });
+        }
+
+        if self.sack_permitted {
+            let blocks = self.generate_sack_blocks();
+            if !blocks.is_empty() {
+                options.push(TcpOption::Sack(blocks));
+            }
         }
 
         let hdr = TcpHeader {
@@ -872,10 +982,17 @@ impl TcpConnection {
 
     fn drain_retransmit_queue(&mut self, ack: Seq, now: Instant) {
         let mut rtt_sample = None;
+        let mut delivered_bytes = 0u64;
+        let mut prior_delivered = self.bbr_delivered;
+        let mut packet_send_time = now;
+
         while let Some(front) = self.retransmit_queue.front() {
             let seg_end = front.seq.wrapping_add(front.seq_len);
             if seg_end.lte(ack) {
                 let seg = self.retransmit_queue.pop_front().unwrap();
+                delivered_bytes += seg.seq_len as u64;
+                prior_delivered = seg.delivered_at_send;
+                packet_send_time = seg.sent_at;
                 if seg.retransmit_count == 0 && rtt_sample.is_none() {
                     rtt_sample = Some(now.duration_since(seg.sent_at));
                 }
@@ -883,8 +1000,13 @@ impl TcpConnection {
                 break;
             }
         }
+
+        self.bbr_delivered += delivered_bytes;
+        self.bbr_delivered_stamp = now;
+
         if let Some(rtt) = rtt_sample {
             self.update_rtt(rtt);
+            self.update_bbr_model(delivered_bytes, prior_delivered, packet_send_time, rtt, now);
         }
     }
 
@@ -910,7 +1032,156 @@ impl TcpConnection {
         self.rto = self.compute_rto();
     }
 
+    fn update_bbr_model(&mut self, delivered: u64, prior_delivered: u64, sent_time: Instant, rtt: Duration, now: Instant) {
+        if rtt < self.bbr_min_rtt || now.duration_since(self.bbr_min_rtt_stamp) > Duration::from_secs(10) {
+            self.bbr_min_rtt = rtt;
+            self.bbr_min_rtt_stamp = now;
+        }
+
+        let delivery_interval = now.duration_since(sent_time);
+        if delivery_interval.as_micros() > 0 && delivered > 0 {
+            let sample_bw = (self.bbr_delivered - prior_delivered) as f64 / delivery_interval.as_micros() as f64;
+            if sample_bw > self.bbr_max_bw {
+                self.bbr_max_bw = sample_bw;
+            }
+        }
+
+        self.update_bbr_state_machine(now);
+    }
+
+    fn update_bbr_state_machine(&mut self, now: Instant) {
+        match self.bbr_state {
+            BbrState::Startup => {
+                if self.bbr_max_bw > self.bbr_full_bw * 1.25 {
+                    self.bbr_full_bw = self.bbr_max_bw;
+                    self.bbr_full_bw_count = 0;
+                } else {
+                    self.bbr_full_bw_count += 1;
+                    if self.bbr_full_bw_count >= 3 {
+                        self.bbr_state = BbrState::Drain;
+                        self.bbr_pacing_gain = 1.0 / 2.89;
+                        self.bbr_cwnd_gain = 2.89;
+                    }
+                }
+            }
+            BbrState::Drain => {
+                let pipe = self.calculate_pipe();
+                let target_cwnd = (self.bbr_max_bw * self.bbr_min_rtt.as_micros() as f64) as u32;
+                if pipe <= target_cwnd {
+                    self.bbr_state = BbrState::ProbeBw;
+                    self.bbr_pacing_gain = 1.25;
+                    self.bbr_cwnd_gain = 2.0;
+                    self.bbr_cycle_stamp = now;
+                    self.bbr_cycle_idx = 0;
+                }
+            }
+            BbrState::ProbeBw => {
+                let cycle_gains = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+                if now.duration_since(self.bbr_cycle_stamp) > self.bbr_min_rtt {
+                    self.bbr_cycle_idx = (self.bbr_cycle_idx + 1) % 8;
+                    self.bbr_pacing_gain = cycle_gains[self.bbr_cycle_idx];
+                    self.bbr_cycle_stamp = now;
+                }
+            }
+            BbrState::ProbeRtt => {
+                if now.duration_since(self.bbr_min_rtt_stamp) > Duration::from_millis(200) {
+                    self.bbr_state = BbrState::ProbeBw;
+                    self.bbr_pacing_gain = 1.0;
+                    self.bbr_cwnd_gain = 2.0;
+                }
+            }
+        }
+
+        let target_cwnd = (self.bbr_max_bw * self.bbr_min_rtt.as_micros() as f64 * self.bbr_cwnd_gain) as u32;
+        self.cwnd = target_cwnd.max(4 * self.mss as u32);
+    }
+
+    pub fn update_sack_scoreboard(&mut self, blocks: &[(Seq, Seq)]) {
+        for &(start, end) in blocks {
+            for seg in self.retransmit_queue.iter_mut() {
+                let seg_start = seg.seq;
+                let seg_end = seg.seq.wrapping_add(seg.seq_len);
+                if start.lte(seg_start) && seg_end.lte(end) {
+                    seg.sacked = true;
+                }
+            }
+        }
+
+        let mut sacked_ahead_count = 0;
+        for i in (0..self.retransmit_queue.len()).rev() {
+            if self.retransmit_queue[i].sacked {
+                sacked_ahead_count += 1;
+            } else if sacked_ahead_count >= 3 {
+                self.retransmit_queue[i].lost = true;
+            }
+        }
+
+        self.pipe = self.calculate_pipe();
+    }
+
+    fn calculate_pipe(&self) -> u32 {
+        let mut outstanding_bytes = 0;
+        for seg in &self.retransmit_queue {
+            if !seg.sacked && !seg.lost {
+                outstanding_bytes += seg.seq_len;
+            }
+        }
+        outstanding_bytes
+    }
+
+    fn next_seg_to_transmit(&mut self) -> Option<(Seq, Vec<u8>)> {
+        for seg in &self.retransmit_queue {
+            if seg.lost && !seg.sacked && seg.retransmit_count == 0 {
+                return Some((seg.seq, seg.data.clone()));
+            }
+        }
+
+        for seg in &self.retransmit_queue {
+            if !seg.sacked && !seg.lost && seg.retransmit_count == 0 {
+                return Some((seg.seq, seg.data.clone()));
+            }
+        }
+
+        if self.pipe < 3 * self.mss as u32 {
+            if let Some(last_seg) = self.retransmit_queue.back() {
+                if !last_seg.sacked && self.rescue_rx != Some(last_seg.seq) {
+                    return Some((last_seg.seq, last_seg.data.clone()));
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn flush_send_buffer(&mut self, tx_queue: &mut VecDeque<Vec<u8>>, now: Instant) {
+        if now < self.bbr_next_pacing_time {
+            return;
+        }
+
+        if self.in_recovery_episode {
+            while self.pipe < self.cwnd {
+                if let Some((seq, packet_data)) = self.next_seg_to_transmit() {
+                    let mut packet = packet_data;
+                    packet[16..18].copy_from_slice(&[0, 0]);
+                    let csum = tcp_checksum(self.tuple.local_ip, self.tuple.remote_ip, &packet);
+                    packet[16..18].copy_from_slice(&csum.to_be_bytes());
+                    tx_queue.push_back(self.encapsulate_ipv4_tcp(packet));
+
+                    if let Some(seg) = self.retransmit_queue.iter_mut().find(|s| s.seq == seq) {
+                        seg.sent_at = now;
+                        seg.retransmit_count += 1;
+                        if self.pipe < 3 * self.mss as u32 {
+                            self.rescue_rx = Some(seq);
+                        }
+                    }
+                    self.pipe = self.calculate_pipe();
+                    self.update_pacing_barrier(self.mss as usize, now);
+                } else {
+                    break;
+                }
+            }
+        }
+
         loop {
             if self.send_buffer.is_empty() { break; }
             let in_flight = self.snd_nxt.wrapping_sub(self.snd_una);
@@ -939,12 +1210,13 @@ impl TcpConnection {
             tx_queue.push_back(self.encapsulate_ipv4_tcp(seg.clone()));
             self.retransmit_queue.push_back(SentSegment {
                 seq: self.snd_nxt, seq_len: chunk.len() as u32,
-                data: seg, sent_at: now, retransmit_count: 0,
+                data: seg, sent_at: now, retransmit_count: 0, sacked: false, lost: false, delivered_at_send: self.bbr_delivered,
             });
             self.snd_nxt = self.snd_nxt.wrapping_add(chunk.len() as u32);
+            self.update_pacing_barrier(chunk_len, now);
         }
 
-        if self.send_buffer.is_empty() && self.fin_requested && self.snd_una == self.snd_nxt {
+        if self.send_buffer.is_empty() && self.receive_buffer.is_empty() && self.fin_requested && self.snd_una == self.snd_nxt {
             match self.state {
                 TcpState::Established => {
                     self.state = TcpState::FinWait1;
@@ -961,6 +1233,11 @@ impl TcpConnection {
         }
     }
 
+    fn update_pacing_barrier(&mut self, len: usize, now: Instant) {
+        let pacing_delay_micros = (len as f64 / (self.bbr_max_bw * self.bbr_pacing_gain)) as u64;
+        self.bbr_next_pacing_time = now + Duration::from_micros(pacing_delay_micros);
+    }
+
     pub fn process_segment(&mut self, hdr: TcpHeader, payload: &[u8], tx_queue: &mut VecDeque<Vec<u8>>, now: Instant) {
         if hdr.flags.contains(TcpFlags::RST) {
             self.state = TcpState::Closed;
@@ -968,8 +1245,14 @@ impl TcpConnection {
         }
 
         for opt in &hdr.options {
-            if let TcpOption::Timestamp { tsval, .. } = opt {
-                self.last_peer_tsval = *tsval;
+            match opt {
+                TcpOption::Timestamp { tsval, .. } => {
+                    self.last_peer_tsval = *tsval;
+                }
+                TcpOption::Sack(blocks) => {
+                    self.update_sack_scoreboard(blocks);
+                }
+                _ => {}
             }
         }
 
@@ -1010,7 +1293,7 @@ impl TcpConnection {
                     self.retransmit_queue.clear();
                 }
             }
-            TcpState::Established => {
+            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::FinWait2 => {
                 self.process_ack(&hdr, tx_queue, now);
                 if payload.len() > 0 {
                     if hdr.seq == self.rcv_nxt {
@@ -1030,40 +1313,28 @@ impl TcpConnection {
                     }
                 }
                 if hdr.flags.contains(TcpFlags::FIN) {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.state = TcpState::CloseWait;
-                    self.send_empty_ack(tx_queue, now);
-                }
-            }
-            TcpState::FinWait1 => {
-                self.process_ack(&hdr, tx_queue, now);
-                if hdr.flags.contains(TcpFlags::FIN) {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.send_empty_ack(tx_queue, now);
-                    if self.snd_una == self.snd_nxt {
-                        self.state = TcpState::TimeWait;
-                        self.time_wait_expiry = Some(now + Duration::from_secs(2));
-                    } else {
-                        self.state = TcpState::Closing;
-                    }
-                } else if self.snd_una == self.snd_nxt {
-                    self.state = TcpState::FinWait2;
-                }
-            }
-            TcpState::FinWait2 => {
-                self.process_ack(&hdr, tx_queue, now);
-                if payload.len() > 0 {
                     if hdr.seq == self.rcv_nxt {
-                        self.receive_buffer.extend(payload);
-                        self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
+                        self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+                        match self.state {
+                            TcpState::Established => {
+                                self.state = TcpState::CloseWait;
+                            }
+                            TcpState::FinWait1 => {
+                                if self.snd_una == self.snd_nxt {
+                                    self.state = TcpState::TimeWait;
+                                    self.time_wait_expiry = Some(now + Duration::from_secs(2));
+                                } else {
+                                    self.state = TcpState::Closing;
+                                }
+                            }
+                            TcpState::FinWait2 => {
+                                self.state = TcpState::TimeWait;
+                                self.time_wait_expiry = Some(now + Duration::from_secs(2));
+                            }
+                            _ => {}
+                        }
                         self.send_empty_ack(tx_queue, now);
                     }
-                }
-                if hdr.flags.contains(TcpFlags::FIN) {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.send_empty_ack(tx_queue, now);
-                    self.state = TcpState::TimeWait;
-                    self.time_wait_expiry = Some(now + Duration::from_secs(2));
                 }
             }
             TcpState::Closing => {
@@ -1072,9 +1343,6 @@ impl TcpConnection {
                     self.state = TcpState::TimeWait;
                     self.time_wait_expiry = Some(now + Duration::from_secs(2));
                 }
-            }
-            TcpState::CloseWait => {
-                self.process_ack(&hdr, tx_queue, now);
             }
             TcpState::LastAck => {
                 self.process_ack(&hdr, tx_queue, now);
@@ -1094,6 +1362,7 @@ impl TcpConnection {
 
     fn process_ack(&mut self, hdr: &TcpHeader, tx_queue: &mut VecDeque<Vec<u8>>, now: Instant) {
         if !hdr.flags.contains(TcpFlags::ACK) { return; }
+
         if self.snd_una.lt(hdr.ack) && hdr.ack.lte(self.snd_nxt) {
             self.dup_ack_count = 0;
             self.snd_una = hdr.ack;
@@ -1104,25 +1373,30 @@ impl TcpConnection {
             }
             self.drain_retransmit_queue(hdr.ack, now);
             self.rto = self.compute_rto();
-            if self.cwnd < self.ssthresh {
-                self.cwnd = self.cwnd.wrapping_add(self.mss as u32);
-            } else {
-                self.cwnd = self.cwnd.wrapping_add((self.mss as u32 * self.mss as u32) / self.cwnd);
+
+            if self.in_recovery_episode {
+                if self.recovery_point.lte(hdr.ack) {
+                    self.in_recovery_episode = false;
+                } else {
+                    self.high_ack = hdr.ack;
+                }
             }
             self.flush_send_buffer(tx_queue, now);
         } else if hdr.ack == self.snd_una && !self.retransmit_queue.is_empty() {
             self.dup_ack_count = self.dup_ack_count.saturating_add(1);
-            if self.dup_ack_count == 3 {
-                self.ssthresh = (self.cwnd / 2).max(2 * self.mss as u32);
-                self.cwnd = self.ssthresh + 3 * self.mss as u32;
-                if let Some(seg) = self.retransmit_queue.front() {
-                    let mut packet = seg.data.clone();
-                    packet[16..18].copy_from_slice(&[0, 0]);
-                    let csum = tcp_checksum(self.tuple.local_ip, self.tuple.remote_ip, &packet);
-                    packet[16..18].copy_from_slice(&csum.to_be_bytes());
-                    let frame = self.encapsulate_ipv4_tcp(packet);
-                    tx_queue.push_back(frame);
+
+            if self.dup_ack_count == 3 && !self.in_recovery_episode {
+                self.in_recovery_episode = true;
+                self.recovery_point = self.snd_nxt;
+                self.high_ack = hdr.ack;
+                self.rescue_rx = None;
+
+                if let Some(first_unacked) = self.retransmit_queue.front_mut() {
+                    first_unacked.lost = true;
                 }
+
+                self.pipe = self.calculate_pipe();
+                self.flush_send_buffer(tx_queue, now);
             }
         }
     }
@@ -1141,20 +1415,33 @@ impl TcpConnection {
                 break;
             }
         }
-        if let Some(seg) = self.retransmit_queue.front() {
-            if now.duration_since(seg.sent_at) >= self.rto {
-                self.ssthresh = (self.cwnd / 2).max(2 * self.mss as u32);
-                self.cwnd = self.mss as u32;
-                self.rto = (self.rto * 2).min(Duration::from_secs(60));
-                let mut packet = seg.data.clone();
-                packet[16..18].copy_from_slice(&[0, 0]);
-                let csum = tcp_checksum(self.tuple.local_ip, self.tuple.remote_ip, &packet);
-                packet[16..18].copy_from_slice(&csum.to_be_bytes());
-                tx_queue.push_back(self.encapsulate_ipv4_tcp(packet));
-                let seg_mut = self.retransmit_queue.front_mut().unwrap();
-                seg_mut.sent_at = now;
-                seg_mut.retransmit_count += 1;
+
+        let mut to_retransmit = None;
+        if let Some(seg) = self.retransmit_queue.front_mut() {
+            if !seg.sacked && now.duration_since(seg.sent_at) >= self.rto {
+                seg.sent_at = now;
+                seg.retransmit_count += 1;
+                to_retransmit = Some(seg.data.clone());
             }
+        }
+
+        if let Some(packet_data) = to_retransmit {
+            self.rto = (self.rto * 2).min(Duration::from_secs(60));
+            self.in_recovery_episode = false;
+
+            if self.bbr_state != BbrState::ProbeRtt {
+                self.bbr_state = BbrState::ProbeRtt;
+                self.bbr_min_rtt_stamp = now;
+                self.bbr_pacing_gain = 1.0;
+                self.bbr_cwnd_gain = 1.0;
+            }
+
+            let mut packet = packet_data;
+            packet[16..18].copy_from_slice(&[0, 0]);
+            let csum = tcp_checksum(self.tuple.local_ip, self.tuple.remote_ip, &packet);
+            packet[16..18].copy_from_slice(&csum.to_be_bytes());
+            let frame = self.encapsulate_ipv4_tcp(packet);
+            tx_queue.push_back(frame);
         }
     }
 

@@ -1,5 +1,5 @@
 use std::time::Instant;
-use wire_core::{Stack, MacAddress, Ipv4Address};
+use wire_core::{Stack, MacAddress, Ipv4Address, TcpState};
 use wire_tap::TapDevice;
 
 fn main() -> anyhow::Result<()> {
@@ -7,10 +7,12 @@ fn main() -> anyhow::Result<()> {
     let mut tap = TapDevice::new("tap0")?;
     let local_mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let local_ip = Ipv4Address([192, 168, 99, 2]);
-    let mut stack = Stack::new(local_mac, local_ip);
+    let gateway_ip = Ipv4Address([192, 168, 99, 1]);
+    let mut stack = Stack::new(local_mac, local_ip, gateway_ip);
     stack.listen(8080);
     let mut buf = [0u8; 2048];
     let mut last_tick = Instant::now();
+
     loop {
         let now = Instant::now();
         if now.duration_since(last_tick) >= std::time::Duration::from_millis(10) {
@@ -29,19 +31,13 @@ fn main() -> anyhow::Result<()> {
             if !data.is_empty() {
                 stack.tcp_send(tuple, &data);
                 stack.flush(now);
-            }
-            if let Some(wire_core::TcpState::CloseWait) = stack.connection_state(tuple) {
+            } else if let Some(TcpState::CloseWait) = stack.connection_state(tuple) {
                 stack.tcp_close(tuple, now);
             }
         }
 
         while let Some(mut tx_packet) = stack.tx_queue.pop_front() {
-            if tx_packet.len() >= 34 {
-                let dst_ip = Ipv4Address(tx_packet[30..34].try_into().unwrap());
-                if let Some(mac) = stack.arp_cache.get(&dst_ip) {
-                    tx_packet[0..6].copy_from_slice(&mac.0);
-                }
-            }
+            stack.resolve_and_populate_dst_mac(&mut tx_packet);
             match tap.write_async(&tx_packet)? {
                 Some(_) => {}
                 None => {
@@ -52,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         if !read_any {
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
     }
 }
