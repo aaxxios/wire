@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wire-core = { path = "../wire-core" }
 libc.workspace = true
 anyhow.workspace = true
+wire-core = { path = "../wire-core" }
+
+[features]
+default = []
+profile = ["wire-core/profile"]

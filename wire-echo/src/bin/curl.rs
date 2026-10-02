@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::{ClientConfig, ClientConnection};
 use wire_core::{build_dns_query, parse_dns_response, Ipv4Address, MacAddress, SocketTuple, Stack, TcpState};
 use wire_tap::TapDevice;
 

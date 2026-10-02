@@ -23,6 +23,10 @@ path = "src/bin/curl.rs"
 name = "wire-xdp-echo"
 path = "src/bin/xdp_echo.rs"
 
+[[bin]]
+name = "wire-redis"
+path = "src/bin/redis.rs"
+
 [dependencies]
 wire-core = { path = "../wire-core" }
 wire-tap = { path = "../wire-tap" }
@@ -33,3 +37,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 rustls.workspace = true
+
+[features]
+default = []
+profile = ["wire-core/profile", "wire-xdp/profile"]

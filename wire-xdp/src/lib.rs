@@ -1,9 +1,11 @@
 use std::ptr;
 use std::sync::atomic::{fence, Ordering};
+use wire_core::probes::{self, StageId};
 
 pub const NUM_FRAMES: usize = 4096;
 pub const FRAME_SIZE: usize = 2048;
-pub const UMEM_SIZE: usize = NUM_FRAMES * FRAME_SIZE;
+pub const UMEM_SIZE: usize = NUM_FRAMES * FRAME_SIZE; // 8MB
+pub const BATCH_SIZE: usize = 64;
 
 const SOL_XDP: libc::c_int = 283;
 const XDP_UMEM_REG: libc::c_int = 3;
@@ -19,6 +21,8 @@ const BPF_MAP_UPDATE_ELEM: i32 = 2;
 const BPF_PROG_LOAD: i32 = 5;
 const BPF_MAP_TYPE_XSKMAP: u32 = 17;
 const BPF_PROG_TYPE_XDP: u32 = 6;
+
+const MAP_HUGE_2MB: libc::c_int = 21 << 26;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -295,6 +299,7 @@ impl XdpRing {
 pub struct XdpSocket {
     fd: i32,
     umem_area: *mut u8,
+    is_hugepage: bool,
     rx_ring: XdpRing,
     tx_ring: XdpRing,
     fill_ring: XdpRing,
@@ -313,12 +318,28 @@ impl XdpSocket {
                 return Err(anyhow::anyhow!("Socket creation error"));
             }
 
-            let mut umem_area: *mut libc::c_void = ptr::null_mut();
-            let ret = libc::posix_memalign(&mut umem_area, 4096, UMEM_SIZE);
-            if ret != 0 {
-                libc::close(fd);
-                return Err(anyhow::anyhow!("UMEM alloc error"));
+            let mut is_hugepage = true;
+            let mut umem_area = libc::mmap(
+                ptr::null_mut(),
+                UMEM_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            );
+
+            if umem_area == libc::MAP_FAILED {
+                is_hugepage = false;
+                let mut aligned_ptr: *mut libc::c_void = ptr::null_mut();
+                let ret = libc::posix_memalign(&mut aligned_ptr, 4096, UMEM_SIZE);
+                if ret != 0 {
+                    libc::close(fd);
+                    return Err(anyhow::anyhow!("UMEM allocation failed"));
+                }
+                umem_area = aligned_ptr;
             }
+
+            let _ = libc::mlock(umem_area, UMEM_SIZE);
 
             let reg = XdpUmemReg {
                 addr: umem_area as u64,
@@ -330,7 +351,11 @@ impl XdpSocket {
 
             let res = libc::setsockopt(fd, SOL_XDP, XDP_UMEM_REG, &reg as *const _ as *const libc::c_void, std::mem::size_of::<XdpUmemReg>() as u32);
             if res < 0 {
-                libc::free(umem_area);
+                if is_hugepage {
+                    libc::munmap(umem_area, UMEM_SIZE);
+                } else {
+                    libc::free(umem_area);
+                }
                 libc::close(fd);
                 return Err(anyhow::anyhow!("setsockopt REG failed"));
             }
@@ -373,6 +398,7 @@ impl XdpSocket {
             let mut socket = Self {
                 fd,
                 umem_area: umem_area as *mut u8,
+                is_hugepage,
                 rx_ring,
                 tx_ring,
                 fill_ring,
@@ -392,6 +418,10 @@ impl XdpSocket {
         self.fd
     }
 
+    pub fn is_hugepage(&self) -> bool {
+        self.is_hugepage
+    }
+
     fn populate_fill_ring(&mut self) {
         let prod = self.fill_prod;
         let ring_mask = self.fill_ring.mask;
@@ -409,8 +439,10 @@ impl XdpSocket {
     }
 
     pub fn poll_read(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        let t_acq = probes::stage_begin(StageId::RxRingAcquire);
         let rx_prod = self.rx_ring.producer_index();
         if self.rx_cons == rx_prod {
+            probes::stage_end(StageId::RxRingAcquire, t_acq);
             return Ok(None);
         }
 
@@ -418,13 +450,16 @@ impl XdpSocket {
         let rx_idx = self.rx_cons & self.rx_ring.mask;
         let rx_descs = self.rx_ring.descs as *const XdpDesc;
         let desc = unsafe { ptr::read_volatile(rx_descs.add(rx_idx as usize)) };
+        probes::stage_end(StageId::RxRingAcquire, t_acq);
 
+        let t_copy = probes::stage_begin(StageId::PayloadCopy);
         let umem_packet_ptr = unsafe { self.umem_area.add(desc.addr as usize) };
         let len = desc.len as usize;
         let copy_len = len.min(buf.len());
         unsafe {
             ptr::copy_nonoverlapping(umem_packet_ptr, buf.as_mut_ptr(), copy_len);
         }
+        probes::stage_end(StageId::PayloadCopy, t_copy);
 
         let fill_idx = self.fill_prod & self.fill_ring.mask;
         let fill_descs = self.fill_ring.descs as *mut u64;
@@ -442,10 +477,54 @@ impl XdpSocket {
         Ok(Some(copy_len))
     }
 
+    #[inline(always)]
+    pub fn poll_read_batch(&mut self, out_packets: &mut [Vec<u8>]) -> usize {
+        let rx_prod = self.rx_ring.producer_index();
+        let available = rx_prod.wrapping_sub(self.rx_cons) as usize;
+        if available == 0 {
+            return 0;
+        }
+
+        fence(Ordering::Acquire);
+        let batch_count = available.min(out_packets.len()).min(BATCH_SIZE);
+        let rx_descs = self.rx_ring.descs as *const XdpDesc;
+        let fill_descs = self.fill_ring.descs as *mut u64;
+
+        for i in 0..batch_count {
+            let rx_idx = (self.rx_cons + i as u32) & self.rx_ring.mask;
+            let desc = unsafe { ptr::read_volatile(rx_descs.add(rx_idx as usize)) };
+            let len = desc.len as usize;
+
+            let umem_packet_ptr = unsafe { self.umem_area.add(desc.addr as usize) };
+            let target_vec = &mut out_packets[i];
+            target_vec.resize(len, 0);
+            unsafe {
+                ptr::copy_nonoverlapping(umem_packet_ptr, target_vec.as_mut_ptr(), len);
+            }
+
+            let fill_idx = (self.fill_prod + i as u32) & self.fill_ring.mask;
+            unsafe {
+                ptr::write_volatile(fill_descs.add(fill_idx as usize), desc.addr & !(FRAME_SIZE as u64 - 1));
+            }
+        }
+
+        self.rx_cons += batch_count as u32;
+        self.fill_prod += batch_count as u32;
+
+        fence(Ordering::Release);
+        self.rx_ring.set_consumer_index(self.rx_cons);
+        self.fill_ring.set_producer_index(self.fill_prod);
+
+        batch_count
+    }
+
     pub fn write_async(&mut self, buf: &[u8]) -> std::io::Result<Option<usize>> {
         self.reclaim_completions();
+        let t_tx = probes::stage_begin(StageId::TxEnqueue);
+
         let tx_cons = self.tx_ring.consumer_index();
         if self.tx_prod - tx_cons >= self.tx_ring.size {
+            probes::stage_end(StageId::TxEnqueue, t_tx);
             return Ok(None);
         }
 
@@ -476,17 +555,21 @@ impl XdpSocket {
             libc::send(self.fd, ptr::null(), 0, libc::MSG_DONTWAIT);
         }
 
+        probes::stage_end(StageId::TxEnqueue, t_tx);
         Ok(Some(buf.len()))
     }
 
     fn reclaim_completions(&mut self) {
+        let t_reap = probes::stage_begin(StageId::TxCompleteReap);
         let comp_prod = self.comp_ring.producer_index();
         if self.comp_cons == comp_prod {
+            probes::stage_end(StageId::TxCompleteReap, t_reap);
             return;
         }
         fence(Ordering::Acquire);
         self.comp_cons = comp_prod;
         self.comp_ring.set_consumer_index(self.comp_cons);
+        probes::stage_end(StageId::TxCompleteReap, t_reap);
     }
 }
 
@@ -494,7 +577,11 @@ impl Drop for XdpSocket {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
-            libc::free(self.umem_area as *mut libc::c_void);
+            if self.is_hugepage {
+                libc::munmap(self.umem_area as *mut libc::c_void, UMEM_SIZE);
+            } else {
+                libc::free(self.umem_area as *mut libc::c_void);
+            }
         }
     }
 }
